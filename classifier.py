@@ -43,8 +43,12 @@ if openrouter_client is None:
         "Groq falla, el sistema depende solo de Groq."
     )
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
-OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+# Verificados en vivo el 15/10/2026 contra las APIs reales antes de fijarlos
+# (los catálogos de modelos gratuitos de Groq/OpenRouter cambian con
+# frecuencia - no asumir que un modelo mencionado en documentación externa
+# sigue existiendo/disponible sin probarlo primero).
+GROQ_MODEL = "openai/gpt-oss-120b"
+OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
 
 class OfferClassification(BaseModel):
