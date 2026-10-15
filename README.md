@@ -2,8 +2,8 @@
 
 Bot autónomo que busca ofertas de prácticas (FCT) para un estudiante de CFGS de
 Desarrollo de Aplicaciones Web (DAW) en Granada/Málaga, las clasifica con
-Gemini, las manda por Telegram para aprobación humana, y ayuda a llevar el
-seguimiento de los contactos con las empresas.
+Groq (con OpenRouter como respaldo), las manda por Telegram para aprobación
+humana, y ayuda a llevar el seguimiento de los contactos con las empresas.
 
 ## Qué hace
 
@@ -12,7 +12,8 @@ seguimiento de los contactos con las empresas.
    `JOOBLE_API_KEY` opcional), Himalayas (ofertas remotas, filtro nativo
    Entry-level) y las webs de empleo (Teamtailor) de un puñado de
    empresas Tier A ya mapeadas (Cívica, idealista/AvaiBook, Freepik/Magnific).
-2. **Clasifica** cada oferta nueva con la API de Gemini en `Tier A` (empresa ya
+2. **Clasifica** cada oferta nueva con Groq (nivel gratuito, API compatible
+   con OpenAI; OpenRouter como respaldo si Groq falla) en `Tier A` (empresa ya
    mapeada + ubicación válida + encaja en el perfil DAW), `Tier B` (mismo
    criterio de contenido/ubicación pero empresa nueva) o `descarte`.
 3. **Notifica** por Telegram cada oferta Tier A/B con botones
@@ -29,8 +30,8 @@ necesitar una base de datos gestionada aparte.
 
 | Componente | Dónde corre | Qué hace |
 |---|---|---|
-| `main.py` | GitHub Actions (cron, 2x/día) | Grafo de LangGraph: busca ofertas nuevas → las clasifica con Gemini → notifica por Telegram → avisa de seguimientos vencidos. Al final del workflow se comitea y pushea `offers.db`. |
-| `classifier.py` | (llamado desde `main.py`) | Llama a Gemini (`gemini-3.5-flash`) para clasificar una oferta. Reintenta en 429 usando el `retryDelay` que devuelve la propia API, con backoff exponencial + jitter como respaldo. |
+| `main.py` | GitHub Actions (cron, 2x/día) | Grafo de LangGraph: busca ofertas nuevas → las clasifica con Groq/OpenRouter → notifica por Telegram → avisa de seguimientos vencidos. Al final del workflow se comitea y pushea `offers.db`. |
+| `classifier.py` | (llamado desde `main.py`) | Llama a Groq (`llama-3.3-70b-versatile`, nivel gratuito) para clasificar una oferta. Reintenta en 429 usando el header `Retry-After` que devuelve la propia API, con backoff exponencial + jitter como respaldo. Si Groq agota los reintentos o falla con un error no recuperable, recurre una vez a OpenRouter (`google/gemma-4-31b-it:free`) como respaldo, solo si `OPENROUTER_API_KEY` está configurada. |
 | `controller.py` | Render (servicio web, siempre encendido) | Bot de Telegram: comandos `/start`, `/status`, `/seguimiento`, y los botones Aprobar/Descartar/Cerrar. |
 | `db.py` | Ambos | Acceso a `offers.db` (SQLite): tabla `offers` (ofertas + decisión humana) y tabla `contacts` (seguimiento a empresas). |
 | `git_sync.py` | Render (vía `controller.py`) | Como Render no tiene disco persistente, cada decisión tomada desde Telegram se comitea y pushea a git al momento (`git add` + `commit` + `pull --rebase --autostash` + `push`), para que no se pierda en el próximo redeploy. |
@@ -66,10 +67,11 @@ Ver `.env.example`. Resumen:
 | `ADZUNA_APP_ID` / `ADZUNA_API_KEY` | Sí | Búsqueda en la API de Adzuna. |
 | `TELEGRAM_BOT_TOKEN` | Sí | Token del bot (BotFather). |
 | `TELEGRAM_CHAT_ID` | Sí | Único chat autorizado para usar el bot. |
-| `GEMINI_API_KEY` | Sí | Clasificación de ofertas. |
+| `GROQ_API_KEY` | Sí | Proveedor principal de clasificación de ofertas (nivel gratuito, sin tarjeta de crédito; `console.groq.com`). |
+| `OPENROUTER_API_KEY` | No | Respaldo de clasificación si Groq falla del todo (`openrouter.ai`, tampoco requiere tarjeta). Sin ella, el respaldo se omite (log de aviso) y la clasificación depende solo de Groq. |
 | `GIT_PUSH_TOKEN` | No | GitHub Personal Access Token (fine-grained, permiso *Contents: Read and write* solo sobre este repo) para que `controller.py`/`git_sync.py` puedan pushear `offers.db` desde Render. Sin ella el bot funciona igual, pero las decisiones no se sincronizan con git y se pierden en el siguiente redeploy. |
 | `JOOBLE_API_KEY` | No | Búsqueda en el agregador Jooble (cobertura España). Se consigue en `es.jooble.org/api/about` (registro self-service, la key llega por email). Sin ella, `search_jooble` no hace ninguna llamada HTTP y esa fuente queda desactivada (el resto sigue funcionando igual). |
-| `MAX_CLASSIFICATIONS_PER_RUN` | No (por defecto 30) | Tope de llamadas a Gemini por ejecución del cron, para no agotar la cuota de golpe. |
+| `MAX_CLASSIFICATIONS_PER_RUN` | No (por defecto 30) | Tope de llamadas a Groq por ejecución del cron, para no agotar la cuota de golpe. |
 
 ## Despliegue
 
@@ -96,10 +98,10 @@ python controller.py    # el bot de Telegram (Flask + polling)
 pytest
 ```
 
-Cubren el backoff de Gemini, el reparto de cupo/reintento de errores en
-`classify_node`, y toda la lógica de `contacts`/`/seguimiento`/recordatorios.
-Usan mocks para Gemini y Telegram — no consumen cuota real ni mandan mensajes
-al ejecutarlos.
+Cubren el backoff de Groq y el respaldo a OpenRouter, el reparto de
+cupo/reintento de errores en `classify_node`, y toda la lógica de
+`contacts`/`/seguimiento`/recordatorios. Usan mocks para Groq/OpenRouter y
+Telegram — no consumen cuota real ni mandan mensajes al ejecutarlos.
 
 ## Decisiones de diseño a tener en cuenta
 

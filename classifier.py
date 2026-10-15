@@ -1,21 +1,50 @@
-"""classifier.py - Clasificación Tier A / Tier B / descarte vía Gemini API (Google)."""
+"""classifier.py - Clasificación Tier A / Tier B / descarte.
+
+Proveedor primario: Groq (nivel gratuito, API compatible con OpenAI). Si Groq
+agota sus reintentos ante un 429 o falla con un error no recuperable, se
+intenta una vez con OpenRouter como respaldo (solo si OPENROUTER_API_KEY está
+configurada). Ya no se usa Gemini para nada (ver historial de git si se
+necesita la implementación anterior)."""
 import logging
 import random
 import time
 from typing import Literal
 
-from google import genai
-from google.genai import types
-from google.genai import errors as genai_errors
-from pydantic import BaseModel, Field
+from openai import OpenAI, RateLimitError
+from pydantic import BaseModel, Field, ValidationError
 
-from config import GEMINI_API_KEY, TIER_A_COMPANIES
+from config import GROQ_API_KEY, OPENROUTER_API_KEY, TIER_A_COMPANIES
 
 logger = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# max_retries=0 en ambos clientes: el reintento ante 429 lo controla por
+# completo el bucle de más abajo (con su propio logging y backoff), en vez
+# de dejar que la librería openai reintente también por su cuenta por
+# debajo (que haría un doble reintento silencioso, sin logs, con su propio
+# calendario de espera superpuesto al nuestro).
+groq_client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
+    max_retries=0,
+)
 
-MODEL = "gemini-3.5-flash"
+openrouter_client = (
+    OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        max_retries=0,
+    )
+    if OPENROUTER_API_KEY
+    else None
+)
+if openrouter_client is None:
+    logger.warning(
+        "Clasificador: OPENROUTER_API_KEY no configurada - sin respaldo si "
+        "Groq falla, el sistema depende solo de Groq."
+    )
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 
 
 class OfferClassification(BaseModel):
@@ -46,61 +75,49 @@ REGLA DE UBICACIÓN: la oferta es válida si es presencial o híbrida en Granada
 remota (independientemente de dónde esté la empresa). Una oferta presencial fuera de Granada/Málaga \
 que no sea remota se descarta siempre.
 
-Devuelve el tier y una justificación breve (1-2 frases) de tu decisión."""
+Devuelve el tier y una justificación breve (1-2 frases) de tu decisión.
+
+Responde ÚNICAMENTE con un objeto JSON, sin texto adicional antes ni después, ni bloques de código, \
+con exactamente estas dos claves:
+{{"tier": "A" | "B" | "descarte", "justification": "<justificación breve en 1-2 frases>"}}"""
 
 
 MAX_RETRIES = 3  # solo para 429 (rate limit) - otros errores no se reintentan
-BASE_BACKOFF_SECONDS = 5  # base del backoff exponencial cuando la API no da retryDelay
-MAX_BACKOFF_SECONDS = 60  # tope superior de espera, venga de retryDelay o del backoff exponencial
+BASE_BACKOFF_SECONDS = 5  # base del backoff exponencial cuando la API no da Retry-After
+MAX_BACKOFF_SECONDS = 60  # tope superior de espera, venga de Retry-After o del backoff exponencial
 
 
-def _extract_retry_delay_seconds(error: genai_errors.APIError) -> float | None:
-    """Busca el retryDelay recomendado que Gemini incluye en los detalles del
-    error 429 de cuota agotada (bloque google.rpc.RetryInfo, p.ej.
-    {"retryDelay": "19s"}) y lo devuelve en segundos.
+def _extract_retry_after_seconds(error: RateLimitError) -> float | None:
+    """Busca el header HTTP estándar `Retry-After` que Groq (y, en general,
+    cualquier API compatible con OpenAI) puede devolver en la respuesta 429.
 
-    Devuelve None si el error no lo expone o no se puede parsear - el SDK
-    google-genai (2.20.0) no expone un atributo retry_delay propio en
-    APIError, solo el cuerpo crudo de la respuesta en `error.details`.
+    A diferencia de Gemini (que mandaba un bloque RetryInfo propio dentro del
+    cuerpo JSON del error), la librería `openai` expone la respuesta HTTP
+    cruda en `error.response` para cualquier APIStatusError (RateLimitError
+    incluida), con `error.response.headers` dando acceso directo a
+    `retry-after` (confirmado leyendo `_base_client.py` de la librería
+    `openai` instalada: su propio mecanismo interno de reintento, que aquí
+    desactivamos con max_retries=0, parsea ese mismo header con
+    `_parse_retry_after_header`). El valor es siempre segundos en texto
+    plano (no hay bloque anidado que parsear como en Gemini).
+
+    Devuelve None si el error no trae ese header o no se puede parsear como
+    float.
     """
-    details = getattr(error, "details", None)
-    if not isinstance(details, dict):
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
         return None
-    error_body = details.get("error", details)
-    if not isinstance(error_body, dict):
+    value = headers.get("retry-after")
+    if value is None:
         return None
-    for item in error_body.get("details", []) or []:
-        if not isinstance(item, dict):
-            continue
-        if "RetryInfo" not in str(item.get("@type", "")):
-            continue
-        delay = item.get("retryDelay")
-        if not delay:
-            continue
-        try:
-            return float(str(delay).rstrip("s"))
-        except (TypeError, ValueError):
-            return None
-    return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def classify_offer(offer) -> tuple[str, str]:
-    """Clasifica una oferta con la API de Gemini.
-
-    Devuelve (tier, justificación). tier es 'A', 'B', 'descarte', o 'error' si la
-    clasificación automática falló. Un 'error' NUNCA se trata como descarte: la
-    oferta se manda igualmente a revisión humana, con el motivo del fallo como
-    justificación.
-
-    Reintenta específicamente ante 429 (límite de peticiones de Gemini) - el
-    nivel gratuito admite solo ~10-15 peticiones/min, e ir clasificando muchas
-    ofertas seguidas sin ritmo lo agota rápido. El tiempo de espera entre
-    reintentos usa el retryDelay que la propia API recomienda en el error
-    (bloque RetryInfo) cuando está presente, o si no, backoff exponencial con
-    jitter (nunca los 15/30/45s fijos de antes), con un tope de
-    MAX_BACKOFF_SECONDS. Otros errores (auth, cuota diaria agotada sin
-    RetryInfo, etc.) no se reintentan, se marcan como 'error' directamente.
-    """
+def _build_messages(offer) -> list[dict]:
     offer_text = (
         f"Título: {offer.title}\n"
         f"Empresa: {offer.company}\n"
@@ -109,45 +126,85 @@ def classify_offer(offer) -> tuple[str, str]:
         f"Fuente: {offer.source}\n"
         f"Descripción: {offer.description[:1500]}"
     )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": offer_text},
+    ]
 
+
+def _attempt(client: OpenAI, model: str, messages: list[dict]) -> OfferClassification:
+    """Un único intento de clasificación contra `client`. Propaga cualquier
+    excepción (de red, de la API, o de validación del JSON devuelto) sin
+    reintentar - el reintento ante 429 lo gestiona _classify_with_groq."""
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+    )
+    content = response.choices[0].message.content
+    return OfferClassification.model_validate_json(content)
+
+
+def _classify_with_groq(messages: list[dict]) -> OfferClassification:
+    """Intenta clasificar con Groq, reintentando ante 429 (límite de
+    peticiones) con backoff. Lanza la excepción (sin reintentar más) en
+    cuanto el error no es un 429, o en cuanto se agotan los MAX_RETRIES
+    reintentos - quien llama decide entonces si recurre a OpenRouter."""
+    last_error: Exception | None = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=offer_text,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    response_mime_type="application/json",
-                    response_json_schema=OfferClassification.model_json_schema(),
-                ),
-            )
-            result = OfferClassification.model_validate_json(response.text)
-            return result.tier, result.justification
-        except genai_errors.APIError as e:
-            if e.code == 429 and attempt < MAX_RETRIES:
-                retry_delay = _extract_retry_delay_seconds(e)
-                if retry_delay is not None:
-                    wait = min(retry_delay, MAX_BACKOFF_SECONDS)
-                    source = "retryDelay de la API"
-                else:
-                    # Backoff exponencial con jitter (base 5s: 5, 10, 20... +
-                    # hasta BASE_BACKOFF_SECONDS de jitter aleatorio) en vez de
-                    # las esperas fijas de antes, para no sincronizar
-                    # reintentos con otros procesos que choquen con el mismo
-                    # límite de cuota.
-                    wait = min(
-                        MAX_BACKOFF_SECONDS,
-                        BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, BASE_BACKOFF_SECONDS),
-                    )
-                    source = "backoff exponencial con jitter"
-                logger.warning(
-                    f"Clasificador: límite de peticiones (429), "
-                    f"reintento {attempt + 1}/{MAX_RETRIES} en {wait:.1f}s ({source})"
+            return _attempt(groq_client, GROQ_MODEL, messages)
+        except RateLimitError as e:
+            last_error = e
+            if attempt >= MAX_RETRIES:
+                break
+            retry_after = _extract_retry_after_seconds(e)
+            if retry_after is not None:
+                wait = min(retry_after, MAX_BACKOFF_SECONDS)
+                source = "Retry-After de la API"
+            else:
+                # Backoff exponencial con jitter (base 5s: 5, 10, 20... +
+                # hasta BASE_BACKOFF_SECONDS de jitter aleatorio), para no
+                # sincronizar reintentos con otros procesos que choquen con
+                # el mismo límite de cuota.
+                wait = min(
+                    MAX_BACKOFF_SECONDS,
+                    BASE_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0, BASE_BACKOFF_SECONDS),
                 )
-                time.sleep(wait)
-                continue
-            logger.error(f"Clasificador: error de la API de Gemini ({e.code}): {e.message}")
-            return "error", f"No se pudo clasificar: error de la API de Gemini ({e.code})"
-        except Exception as e:
-            logger.error(f"Clasificador: error inesperado: {e}")
-            return "error", f"No se pudo clasificar: {e}"
+                source = "backoff exponencial con jitter"
+            logger.warning(
+                f"Clasificador: límite de peticiones de Groq (429), "
+                f"reintento {attempt + 1}/{MAX_RETRIES} en {wait:.1f}s ({source})"
+            )
+            time.sleep(wait)
+    raise last_error
+
+
+def classify_offer(offer) -> tuple[str, str]:
+    """Clasifica una oferta, primero con Groq y, si falla del todo, con
+    OpenRouter como respaldo (solo si OPENROUTER_API_KEY está configurada).
+
+    Devuelve (tier, justificación). tier es 'A', 'B', 'descarte', o 'error' si
+    la clasificación automática falló con ambos proveedores (o solo con Groq,
+    si no hay respaldo configurado). Un 'error' NUNCA se trata como descarte:
+    la oferta se manda igualmente a revisión humana, con el motivo del fallo
+    como justificación.
+    """
+    messages = _build_messages(offer)
+
+    try:
+        result = _classify_with_groq(messages)
+        return result.tier, result.justification
+    except (RateLimitError, ValidationError, Exception) as e:
+        logger.error(f"Clasificador: Groq falló ({e})")
+        groq_error = e
+
+    if openrouter_client is None:
+        return "error", f"No se pudo clasificar: Groq falló ({groq_error}) y no hay OPENROUTER_API_KEY configurada"
+
+    try:
+        result = _attempt(openrouter_client, OPENROUTER_MODEL, messages)
+        return result.tier, result.justification
+    except Exception as e:
+        logger.error(f"Clasificador: respaldo de OpenRouter también falló ({e})")
+        return "error", f"No se pudo clasificar: Groq falló ({groq_error}) y OpenRouter también falló ({e})"

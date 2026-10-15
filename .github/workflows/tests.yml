@@ -32,5 +32,5 @@ jobs:
           ADZUNA_API_KEY: test-adzuna-api-key
           TELEGRAM_BOT_TOKEN: test-telegram-bot-token
           TELEGRAM_CHAT_ID: "000000000"
-          GEMINI_API_KEY: test-gemini-api-key
+          GROQ_API_KEY: test-groq-api-key
         run: pytest
