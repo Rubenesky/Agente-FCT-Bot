@@ -3,12 +3,15 @@ AGENTE DE BÚSQUEDA DE PRÁCTICAS FCT
 =====================================================
 Características:
 - Búsqueda en fuentes activas: Adzuna, Tecnoempleo, Jooble (requiere
-  JOOBLE_API_KEY, opcional), Himalayas (remoto), webs de empresas Tier A vía
+  JOOBLE_API_KEY, opcional), EURES (API pública de la UE, republica los
+  datos del SEPE/Empléate), webs de empresas Tier A vía
   Teamtailor (Fase 6: Freepik/Magnific, idealista/AvaiBook, Cívica; el resto de
   empresas Tier A no tienen ATS con feed público conocido, ver plan). Indeed,
   InfoJobs y LinkedIn descartadas por bloqueo anti-bot serio (RSS muertos o
-  CAPTCHA), ver notas junto a sus funciones de búsqueda; se investigará
-  SEPE/otras fuentes más adelante
+  CAPTCHA), ver notas junto a sus funciones de búsqueda; el SEPE directo
+  (RSS por categoría) también descartado - su servidor no responde desde
+  IPs de datacenter como las de GitHub Actions (confirmado en vivo
+  01/11/2026), de ahí el rodeo vía EURES
 - Clasificación Tier A / Tier B / descarte vía API de Gemini (classifier.py)
 - Memoria persistente (no repite ofertas vistas)
 - Sin aprobación automática: todo lo no descartado se notifica por Telegram
@@ -515,57 +518,92 @@ def search_jooble(keyword: str, location: str) -> list[JobOffer]:
         logger.error(f"Error en Jooble: {e}")
         return []
 
-# 7. Himalayas (API abierta, sin key, remoto con filtro nativo entry-level)
-# Endpoint público sin autenticación: GET himalayas.app/jobs/api/search.
-# Esquema de respuesta confirmado en vivo contra la API real: {"jobs": [...],
-# "totalCount", "offset", "limit"}, cada oferta con "title", "excerpt",
-# "description" (HTML completo), "companyName", "applicationLink" (URL para
-# aplicar), "guid", "pubDate", "expiryDate", "employmentType",
-# "locationRestrictions" (países donde puede estar el candidato - filtro de
-# elegibilidad, no la sede de la empresa, ya que todo lo que devuelve esta
-# API es remoto).
+# 7. EURES (portal de empleo de la Unión Europea, API pública sin key)
+# Endpoint: POST https://europa.eu/eures/api/jv-searchengine/public/jv-search/search.
+# Documentación no oficial (reverse-engineered, github.com/rorar/EURES-API-Documentation)
+# - no hay garantía de estabilidad por parte de la Comisión Europea, pero el
+# endpoint en sí es de europa.eu, no de un tercero. Confirmado en vivo
+# (01/11/2026) que cada oferta trae "source": "empleate": EURES republica
+# los mismos datos del SEPE/Empléate, con la ventaja de que su servidor sí
+# responde desde IPs de datacenter (el SEPE directo no, ver nota en
+# search_node). El nombre de la empresa no viene en el listado (igual que
+# en el SEPE directo, redactado por privacidad en buena parte de las
+# ofertas) - se deja un literal fijo en vez de un dato inventado.
 #
-# Como es 100% remoto, una ciudad española no filtra nada aquí: se llama una
-# sola vez por ejecución, fuera del bucle CITIES x KEYWORDS (igual que
-# TIER_A_TEAMTAILOR_SOURCES/search_teamtailor), iterando solo sobre un
-# subconjunto reducido de keywords EN INGLÉS. Verificado en vivo contra la
-# API real: términos en español ("DAW", "desarrollo", "programación")
-# devuelven mucho ruido (ofertas de negocio/ventas/docencia que solo
-# coinciden por palabras sueltas), porque Himalayas es un agregador
-# internacional en inglés - "software developer"/"web developer"/
-# "junior developer" devuelven resultados consistentemente relevantes al
-# perfil DAW. Menos ruido también implica no desperdiciar cupo de
-# MAX_CLASSIFICATIONS_PER_RUN en ofertas irrelevantes.
-HIMALAYAS_KEYWORDS = ["software developer", "web developer", "junior developer"]
+# El filtro locationCodes solo funciona de forma fiable a nivel NUTS2
+# (comunidad autónoma, ej. "es61" = Andalucía); probado en vivo que
+# filtrar directamente por NUTS3 (ej. "ES614" = Granada) devuelve siempre
+# 0 resultados pese a que esos mismos códigos sí aparecen en el campo
+# locationMap de la respuesta. Por eso se pide toda Andalucía y se filtra
+# a mano por EURES_NUTS3_BY_CITY, quedándose solo con Granada/Málaga.
+#
+# La URL de detalle (https://europa.eu/eures/portal/jv-se/jv-details/{id})
+# se confirmó contra un resultado real indexado públicamente - es una SPA,
+# pero carga el contenido igual en un navegador normal.
+EURES_REGION_CODE = "es61"  # Andalucía (NUTS2)
+EURES_NUTS3_BY_CITY = {"Granada": "ES614", "Málaga": "ES617"}  # NUTS3
 
-def search_himalayas(keyword: str, limit: int = 10) -> list[JobOffer]:
-    """Busca ofertas remotas Entry-level en la API abierta de Himalayas."""
+def search_eures(keyword: str) -> list[JobOffer]:
+    """Busca ofertas en la API pública de EURES, filtrando por Andalucía y
+    quedándose solo con las de Granada/Málaga (ver nota arriba)."""
     try:
-        url = "https://himalayas.app/jobs/api/search"
-        response = requests.get(url, params={
-            "q": keyword,
-            "seniority": "Entry-level",
-            "limit": limit
-        }, timeout=15)
+        url = "https://europa.eu/eures/api/jv-searchengine/public/jv-search/search"
+        payload = {
+            "resultsPerPage": 10,
+            "page": 1,
+            "sortSearch": "BEST_MATCH",
+            "keywords": [{"keyword": keyword, "specificSearchCode": "TITLE"}],
+            "publicationPeriod": "LAST_MONTH",
+            "occupationUris": [],
+            "skillUris": [],
+            "requiredExperienceCodes": [],
+            "positionScheduleCodes": [],
+            "sectorCodes": [],
+            "educationAndQualificationLevelCodes": [],
+            "positionOfferingCodes": [],
+            "locationCodes": [EURES_REGION_CODE],
+            "euresFlagCodes": [],
+            "otherBenefitsCodes": [],
+            "requiredLanguages": [],
+            "minNumberPost": None,
+            "sessionId": f"agente-fct-{keyword}",
+            "requestLanguage": "es",
+        }
+        response = requests.post(url, json=payload, timeout=15)
         if response.status_code != 200:
             return []
         data = response.json()
         offers = []
-        for item in data.get('jobs', []):
+        for jv in data.get('jvs', []):
+            nuts3_codes = jv.get('locationMap', {}).get('ES', [])
+            city = next(
+                (c for c, code in EURES_NUTS3_BY_CITY.items() if code in nuts3_codes),
+                None
+            )
+            if city is None:
+                continue
+
+            description = jv.get('description') or ''
+            mode = "Presencial"
+            if "teletrabajo" in description.lower() or "remoto" in description.lower():
+                mode = "Remoto"
+            elif "híbrid" in description.lower() or "hibrid" in description.lower():
+                mode = "Híbrida"
+
             offer = JobOffer(
-                title=item.get('title', 'Sin título'),
-                location="Remoto",
-                mode="Remoto",
-                company=item.get('companyName', 'Empresa desconocida'),
-                url=item.get('applicationLink', '#'),
-                source="Himalayas",
-                description=item.get('excerpt', ''),
+                title=jv.get('title', 'Sin título'),
+                location=city,
+                mode=mode,
+                company="Empresa no especificada",
+                url=f"https://europa.eu/eures/portal/jv-se/jv-details/{jv.get('id', '')}?lang=es",
+                source="EURES",
+                description=description[:500],
                 found_date=datetime.now().isoformat()
             )
             offers.append(offer)
         return offers
     except Exception as e:
-        logger.error(f"Error en Himalayas: {e}")
+        logger.error(f"Error en EURES: {e}")
         return []
 
 # ============================================
@@ -622,9 +660,8 @@ def search_node(state: State) -> State:
             # Indeed e InfoJobs: descartadas por bloqueo anti-bot serio (RSS
             # muertos o CAPTCHA), ver notas junto a search_indeed_rss /
             # search_infojobs_rss más arriba. LinkedIn se descartó por el
-            # mismo motivo. Jooble e Himalayas se añadieron como reemplazo
-            # de cobertura (13/09/2026); se investigará SEPE/otras fuentes
-            # más adelante.
+            # mismo motivo. Jooble se añadió como reemplazo de cobertura
+            # (13/09/2026); se investigará SEPE/otras fuentes más adelante.
 
             time.sleep(0.5)
 
@@ -637,14 +674,16 @@ def search_node(state: State) -> State:
             logger.info(f"    + Teamtailor ({company_label}): {len(tt_offers)} ofertas")
             all_found.extend(tt_offers)
 
-    # 5. Himalayas (remoto) - también fuera del bucle de ciudades: es 100%
-    # remoto, una ciudad española no filtra nada aquí. Solo un subconjunto
-    # reducido de KEYWORDS (ver HIMALAYAS_KEYWORDS más arriba).
-    for keyword in HIMALAYAS_KEYWORDS:
-        himalayas_offers = search_himalayas(keyword)
-        if himalayas_offers:
-            logger.info(f"    + Himalayas ({keyword}): {len(himalayas_offers)} ofertas")
-            all_found.extend(himalayas_offers)
+    # 5. EURES - también fuera del bucle de ciudades: filtra por toda
+    # Andalucía (ver nota junto a search_eures sobre por qué no se puede
+    # filtrar directamente por Granada/Málaga) y la propia función ya
+    # descarta client-side lo que no sea de esas dos ciudades.
+    for keyword in KEYWORDS:
+        eures_offers = search_eures(keyword)
+        if eures_offers:
+            logger.info(f"    + EURES ({keyword}): {len(eures_offers)} ofertas")
+            all_found.extend(eures_offers)
+        time.sleep(0.5)
 
     logger.info(f"Resumen: {len(all_found)} ofertas totales encontradas")
 

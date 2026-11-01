@@ -5,8 +5,8 @@ producción desde hace tiempo (no son código nuevo); las pruebas de este
 fichero documentan el comportamiento real observado leyendo main.py, no un
 comportamiento asumido o "deseable".
 
-Jooble e Himalayas (añadidas más recientemente) ya tienen su propia
-cobertura en test_main_search_sources.py - no se duplica aquí.
+Jooble (añadida más recientemente) ya tiene su propia cobertura en
+test_main_search_sources.py - no se duplica aquí.
 
 Adzuna: GET https://api.adzuna.com/v1/api/jobs/es/search/1 con params
 app_id/app_key/what/where/results_per_page/content-type. Respuesta

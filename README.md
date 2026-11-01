@@ -9,9 +9,10 @@ humana, y ayuda a llevar el seguimiento de los contactos con las empresas.
 
 1. **Busca** ofertas 2 veces al día (cron de GitHub Actions) en Adzuna,
    Tecnoempleo (RSS), Jooble (agregador con cobertura España, requiere
-   `JOOBLE_API_KEY` opcional), Himalayas (ofertas remotas, filtro nativo
-   Entry-level) y las webs de empleo (Teamtailor) de un puñado de
-   empresas Tier A ya mapeadas (Cívica, idealista/AvaiBook, Freepik/Magnific).
+   `JOOBLE_API_KEY` opcional), EURES (portal de empleo de la UE, republica
+   los datos del SEPE/Empléate) y las webs de empleo (Teamtailor) de un
+   puñado de empresas Tier A ya mapeadas (Cívica, idealista/AvaiBook,
+   Freepik/Magnific).
 2. **Clasifica** cada oferta nueva con Groq (nivel gratuito, API compatible
    con OpenAI; OpenRouter como respaldo si Groq falla) en `Tier A` (empresa ya
    mapeada + ubicación válida + encaja en el perfil DAW), `Tier B` (mismo
