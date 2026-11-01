@@ -27,6 +27,8 @@ import io
 import logging
 import re
 import time
+import html
+from urllib.parse import quote
 from datetime import datetime
 from typing import TypedDict
 from pydantic import BaseModel
@@ -118,13 +120,23 @@ def send_telegram(message):
 TIER_EMOJI = {"A": "🅰️", "B": "🅱️", "error": "⚠️"}
 
 def format_offer_message(offer) -> str:
+    """Construye el texto HTML del mensaje. Todos los campos de la oferta
+    vienen de fuentes externas (APIs/RSS de terceros, ofertas publicadas por
+    cualquier empresa) y nunca se tratan como confiables: se escapan con
+    html.escape antes de interpolarlos, para que un título/descripción con
+    '<', '>', '&' o comillas no rompa el parseo HTML de Telegram (que
+    devolvería 400 y la oferta se perdería en silencio, igual que pasó con
+    el token caído) ni se salga del atributo href='...'."""
+    def esc(value) -> str:
+        return html.escape(str(value), quote=True)
+
     emoji = TIER_EMOJI.get(offer.tier, "❔")
-    message = f"{emoji} <b>Tier {offer.tier}</b> — <b>{offer.title[:80]}</b>\n"
-    message += f"🏢 {offer.company}\n"
-    message += f"📍 {offer.location} ({offer.mode})\n"
-    message += f"📌 {offer.source}\n"
-    message += f"💬 {offer.justification}\n"
-    message += f"🔗 <a href='{offer.url}'>Ver oferta</a>"
+    message = f"{emoji} <b>Tier {esc(offer.tier)}</b> — <b>{esc(offer.title[:80])}</b>\n"
+    message += f"🏢 {esc(offer.company)}\n"
+    message += f"📍 {esc(offer.location)} ({esc(offer.mode)})\n"
+    message += f"📌 {esc(offer.source)}\n"
+    message += f"💬 {esc(offer.justification)}\n"
+    message += f"🔗 <a href='{esc(offer.url)}'>Ver oferta</a>"
     return message
 
 def send_offer_for_review(offer):
@@ -583,6 +595,16 @@ def search_eures(keyword: str) -> list[JobOffer]:
             if city is None:
                 continue
 
+            # El id lo genera la propia API de EURES, pero al venir de una
+            # documentación no oficial (reverse-engineered) se trata como
+            # dato externo no confiable: se descarta la oferta si falta, y
+            # se url-encodea (quote, safe='') antes de meterlo en la URL
+            # para que no pueda romper la ruta si algún día trae caracteres
+            # inesperados.
+            jv_id = str(jv.get('id') or '')
+            if not jv_id:
+                continue
+
             description = jv.get('description') or ''
             mode = "Presencial"
             if "teletrabajo" in description.lower() or "remoto" in description.lower():
@@ -595,7 +617,7 @@ def search_eures(keyword: str) -> list[JobOffer]:
                 location=city,
                 mode=mode,
                 company="Empresa no especificada",
-                url=f"https://europa.eu/eures/portal/jv-se/jv-details/{jv.get('id', '')}?lang=es",
+                url=f"https://europa.eu/eures/portal/jv-se/jv-details/{quote(jv_id, safe='')}?lang=es",
                 source="EURES",
                 description=description[:500],
                 found_date=datetime.now().isoformat()
